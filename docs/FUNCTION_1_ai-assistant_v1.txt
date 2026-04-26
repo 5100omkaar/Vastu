@@ -1,0 +1,160 @@
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type",
+};
+
+serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response(null, { headers: corsHeaders });
+  }
+
+  try {
+    console.log("=== AI Assistant Request Started ===");
+
+    const body = await req.json();
+    const { messages, mode } = body;
+
+    console.log("Mode:", mode);
+    console.log("Messages count:", messages?.length);
+
+    const GOOGLE_API_KEY = Deno.env.get("GOOGLE_API_KEY");
+    if (!GOOGLE_API_KEY) {
+      console.error("GOOGLE_API_KEY not found in environment");
+      throw new Error("GOOGLE_API_KEY is not configured. Please add it to Supabase Edge Functions secrets.");
+    }
+    console.log("API key found (length:", GOOGLE_API_KEY.length, ")");
+
+    const isImageMode = mode === "image";
+
+    const systemPrompt = isImageMode
+      ? "You are a creative AI assistant."
+      : "You are VastuVista AI Assistant — a knowledgeable, friendly assistant specializing in Vastu Shastra, architecture, and home design. Format responses with markdown when appropriate.";
+
+    // Build Gemini contents array
+    const geminiContents = [];
+
+    geminiContents.push({
+      role: "user",
+      parts: [{ text: systemPrompt }]
+    });
+    geminiContents.push({
+      role: "model",
+      parts: [{ text: "I understand. I'm ready to help!" }]
+    });
+
+    for (const msg of messages) {
+      const role = msg.role === "assistant" ? "model" : "user";
+      let text = "";
+
+      if (typeof msg.content === "string") {
+        text = msg.content;
+      } else if (Array.isArray(msg.content)) {
+        text = msg.content.map(p => p.text || "").join(" ");
+      }
+
+      if (text) {
+        geminiContents.push({
+          role: role,
+          parts: [{ text: text }]
+        });
+      }
+    }
+
+    console.log("Prepared", geminiContents.length, "content parts");
+
+    // Try v1 API with gemini-1.5-flash
+    console.log("Calling Gemini API v1 with model: gemini-1.5-flash");
+
+    const aiResponse = await fetch(
+      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${GOOGLE_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: geminiContents,
+          generationConfig: {
+            temperature: 0.7,
+            maxOutputTokens: 2048,
+          }
+        }),
+      }
+    );
+
+    console.log("Response status:", aiResponse.status);
+
+    if (!aiResponse.ok) {
+      const errorText = await aiResponse.text();
+      console.error(`Gemini API error (${aiResponse.status}):`, errorText);
+      throw new Error("Unable to connect to AI service. Please check your API key and try again.");
+    }
+
+    console.log("✅ Success! Gemini API responded");
+
+    const data = await aiResponse.json();
+    const responseText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+
+    if (!responseText) {
+      console.error("No text in response:", JSON.stringify(data).substring(0, 500));
+      throw new Error("AI did not return a response");
+    }
+
+    console.log("Got response, length:", responseText.length);
+
+    // Return streaming format for chat
+    if (!isImageMode) {
+      const encoder = new TextEncoder();
+      const stream = new ReadableStream({
+        start(controller) {
+          try {
+            const chunk = {
+              choices: [{
+                delta: { content: responseText }
+              }]
+            };
+
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+            controller.enqueue(encoder.encode(`data: [DONE]\n\n`));
+            controller.close();
+          } catch (e) {
+            console.error("Stream error:", e);
+            controller.error(e);
+          }
+        }
+      });
+
+      return new Response(stream, {
+        headers: {
+          ...corsHeaders,
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive"
+        },
+      });
+    }
+
+    // Image mode response
+    return new Response(
+      JSON.stringify({ text: responseText, images: [] }),
+      {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      }
+    );
+
+  } catch (e) {
+    console.error("=== AI Assistant Error ===");
+    console.error(e);
+
+    const errorMessage = e instanceof Error ? e.message : "Unknown error";
+
+    return new Response(
+      JSON.stringify({ error: errorMessage }),
+      {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      }
+    );
+  }
+});

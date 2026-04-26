@@ -1,0 +1,7 @@
+project_id = "ssrrrtcjeztpwskntjvr"
+
+[functions.vastu-analyze]
+verify_jwt = false
+
+[functions.ai-assistant]
+verify_jwt = false
